@@ -1,0 +1,22 @@
+{
+  "name": "kiro-telegram",
+  "version": "1.1.0",
+  "description": "Telegram & Discord bot that bridges to Kiro CLI via ACP protocol",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "download-kiro-cli": "node scripts/download-kiro-cli.mjs"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.3",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/node-telegram-bot-api": "^0.64.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

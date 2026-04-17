@@ -1,0 +1,69 @@
+/**
+ * Kiro Bot — entry point.
+ * Bridges Telegram and/or Discord to kiro-cli via ACP protocol.
+ * Updated: session pool, env var expansion, reaction config.
+ */
+import dns from 'node:dns';
+dns.setDefaultResultOrder('ipv4first');
+
+import { loadConfig } from './config.js';
+import { logger } from './logger.js';
+import { createSessionPool } from './sessionPool.js';
+import { createTelegramBot } from './telegramBot.js';
+import { createDiscordBot } from './discordBot.js';
+
+async function main() {
+  const config = loadConfig();
+  const { frontend } = config;
+
+  const needTelegram = frontend === 'telegram' || frontend === 'both';
+  const needDiscord = frontend === 'discord' || frontend === 'both';
+
+  if (needTelegram && !config.telegram.botToken) {
+    logger.error('Telegram enabled but no botToken. Set telegram.botToken in ~/.kiro-bridge/config.json');
+    process.exit(1);
+  }
+  if (needDiscord && !config.discord.botToken) {
+    logger.error('Discord enabled but no botToken. Set discord.botToken in ~/.kiro-bridge/config.json');
+    process.exit(1);
+  }
+
+  logger.info('Starting', { frontend, command: config.acp.command, workspace: config.workspace });
+
+  const pool = createSessionPool(
+    config.acp.command, config.acp.args, config.workspace, config.acp.env, config.pool,
+  );
+
+  const stoppers: Array<() => void | Promise<void>> = [() => pool.stopAll()];
+
+  if (needTelegram) {
+    const tg = createTelegramBot(config.telegram.botToken, config.telegram.allowedUsers, pool, config.workspace);
+    stoppers.push(() => tg.stop());
+  }
+
+  if (needDiscord) {
+    const dc = createDiscordBot({
+      botToken: config.discord.botToken,
+      allowedChannels: config.discord.allowedChannels,
+      allowedUsers: config.discord.allowedUsers,
+      allowBotMessages: config.discord.allowBotMessages,
+      trustedBotIds: config.discord.trustedBotIds,
+      reactionsConfig: config.reactions,
+    }, pool, config.workspace);
+    stoppers.push(() => dc.stop());
+  }
+
+  logger.info('Running. Ctrl+C to stop.');
+
+  const shutdown = async () => {
+    for (const stop of stoppers) await stop();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+main().catch((err) => {
+  logger.error('Fatal', { error: err.message ?? err });
+  process.exit(1);
+});
