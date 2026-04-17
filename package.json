@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "discord.js": "^14.26.3",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "sharp": "^0.33.5"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

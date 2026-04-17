@@ -48,7 +48,7 @@ async function main() {
   const stoppers: Array<() => void | Promise<void>> = [() => pool.stopAll()];
 
   if (needTelegram) {
-    const tg = createTelegramBot(config.telegram.botToken, config.telegram.allowedUsers, pool, config.workspace);
+    const tg = createTelegramBot(config.telegram.botToken, config.telegram.allowedUsers, pool, config.workspace, config.stt);
     stoppers.push(() => tg.stop());
   }
 
@@ -60,6 +60,7 @@ async function main() {
       allowBotMessages: config.discord.allowBotMessages,
       trustedBotIds: config.discord.trustedBotIds,
       reactionsConfig: config.reactions,
+      sttConfig: config.stt,
     }, pool, config.workspace);
     stoppers.push(() => dc.stop());
   }

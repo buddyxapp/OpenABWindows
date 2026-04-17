@@ -1,11 +1,13 @@
 /**
  * Telegram Bot — bridges Telegram messages to Kiro via ACP.
- * Updated: uses session pool, ContentBlock[] prompts, sender context.
+ * Updated: image resize, audio STT, session pool, ContentBlock[].
  */
 import TelegramBot from 'node-telegram-bot-api';
 import { logger } from './logger.js';
 import type { SessionPool } from './sessionPool.js';
 import type { AcpEvent, ContentBlock } from './acpProtocol.js';
+import type { SttConfig } from './config.js';
+import { processImage, transcribeAudio } from './media.js';
 
 interface ToolEntry { id: string; title: string; state: 'running' | 'completed' | 'failed' }
 
@@ -40,7 +42,7 @@ export interface TelegramBotHandle { stop(): void }
 
 export function createTelegramBot(
   botToken: string, allowedUsers: number[],
-  pool: SessionPool, workspacePath: string,
+  pool: SessionPool, workspacePath: string, sttConfig: SttConfig,
 ): TelegramBotHandle {
   const bot = new TelegramBot(botToken, {
     polling: true,
@@ -55,15 +57,22 @@ export function createTelegramBot(
     catch { try { await bot.editMessageText(text, { chat_id: chatId, message_id: msgId }); } catch { /* ignore */ } }
   }
 
+  /** Get Telegram file download URL */
+  async function getFileUrl(fileId: string): Promise<string | null> {
+    try {
+      const file = await bot.getFile(fileId);
+      return file.file_path ? `https://api.telegram.org/file/bot${botToken}/${file.file_path}` : null;
+    } catch { return null; }
+  }
+
   bot.onText(/\/start/, async (msg) => {
     if (!allowed(msg.from!.id)) return bot.sendMessage(msg.chat.id, '🚫 未授權');
-    await bot.sendMessage(msg.chat.id, '👋 Kiro Bridge Bot\n\n直接輸入文字即可對話。\n\n/new — 新 session\n/cancel — 取消\n/status — 狀態');
+    await bot.sendMessage(msg.chat.id, '👋 Kiro Bridge Bot\n\n直接輸入文字即可對話。\n支援圖片和語音訊息。\n\n/new — 新 session\n/cancel — 取消\n/status — 狀態');
   });
 
   bot.onText(/\/new/, async (msg) => {
     if (!allowed(msg.from!.id)) return;
-    const key = `tg-${msg.chat.id}`;
-    pool.release(key);
+    pool.release(`tg-${msg.chat.id}`);
     await bot.sendMessage(msg.chat.id, '✅ 新 session 已建立');
   });
 
@@ -75,26 +84,59 @@ export function createTelegramBot(
 
   bot.onText(/\/status/, async (msg) => {
     if (!allowed(msg.from!.id)) return;
-    await bot.sendMessage(msg.chat.id, `📂 ${workspacePath}\n⏳ 處理中: ${processingChats.has(msg.chat.id) ? '是' : '否'}`);
+    await bot.sendMessage(msg.chat.id, `📂 ${workspacePath}\n⏳ 處理中: ${processingChats.has(msg.chat.id) ? '是' : '否'}\n🎤 STT: ${sttConfig.enabled ? '開啟' : '關閉'}`);
   });
 
   bot.on('message', async (msg) => {
-    if (msg.text?.startsWith('/') || !msg.text || !msg.from || !allowed(msg.from.id)) return;
+    if (!msg.from || !allowed(msg.from.id)) return;
+    if (msg.text?.startsWith('/')) return;
+
     const chatId = msg.chat.id;
+    const hasText = !!msg.text || !!msg.caption;
+    const hasPhoto = !!msg.photo?.length;
+    const hasVoice = !!msg.voice || !!msg.audio;
+    if (!hasText && !hasPhoto && !hasVoice) return;
 
     if (processingChats.has(chatId)) {
       await bot.sendMessage(chatId, '⏳ 處理中，請稍候或 /cancel');
       return;
     }
     processingChats.add(chatId);
-
     const safetyTimer = setTimeout(() => processingChats.delete(chatId), 360000);
 
     try {
       const key = `tg-${chatId}`;
       const backend = await pool.getOrCreate(key, workspacePath);
-
       const ph = await bot.sendMessage(chatId, '🧠 思考中...');
+
+      let prompt = msg.text || msg.caption || '';
+      const content: ContentBlock[] = [];
+
+      // Process photos — take largest
+      if (hasPhoto) {
+        const photo = msg.photo![msg.photo!.length - 1];
+        const url = await getFileUrl(photo.file_id);
+        if (url) {
+          const img = await processImage(url);
+          if (img) content.push({ type: 'image', media_type: img.mediaType, data: img.data });
+        }
+      }
+
+      // Process voice/audio → STT
+      if (hasVoice) {
+        const fileId = msg.voice?.file_id || msg.audio?.file_id;
+        if (fileId) {
+          const url = await getFileUrl(fileId);
+          if (url) {
+            const text = await transcribeAudio(url, sttConfig);
+            if (text) prompt = (prompt ? prompt + '\n\n' : '') + `[🎤 語音訊息]: ${text}`;
+          }
+        }
+      }
+
+      const senderCtx = `<sender_context>\n  userId: ${msg.from.id}\n  displayName: ${msg.from.first_name}\n  platform: telegram\n</sender_context>\n\n`;
+      content.unshift({ type: 'text', text: senderCtx + prompt });
+
       let textBuf = '';
       const tools: ToolEntry[] = [];
       let lastEdit = 0;
@@ -126,9 +168,6 @@ export function createTelegramBot(
           schedEdit();
         }
       };
-
-      const senderCtx = `<sender_context>\n  userId: ${msg.from.id}\n  displayName: ${msg.from.first_name}\n  platform: telegram\n</sender_context>\n\n`;
-      const content: ContentBlock[] = [{ type: 'text', text: senderCtx + msg.text }];
 
       const full = await backend.sendPrompt(content, onEvent);
       if (editTimer) clearTimeout(editTimer);

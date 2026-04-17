@@ -2,7 +2,7 @@
  * ACP Backend — long-lived kiro-cli acp process, JSON-RPC over stdin/stdout.
  * Updated: ContentBlock[] prompts, session/load for pool resumption.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { logger } from './logger.js';
 import {
@@ -113,7 +113,18 @@ export function createAcpBackend(
       promptSubscriber = null; sessionId = null;
       for (const [, p] of pending) p.reject(new Error('stopped'));
       pending.clear();
-      try { proc.kill(); } catch { /* ignore */ }
+      // Process tree kill: Windows uses taskkill /T, Unix uses negative PID
+      try {
+        if (proc.pid) {
+          const pid = proc.pid;
+          if (process.platform === 'win32') {
+            execSync(`taskkill /T /F /PID ${pid}`, { stdio: 'ignore' });
+          } else {
+            process.kill(-pid, 'SIGTERM');
+            setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ } }, 3000);
+          }
+        }
+      } catch { try { proc?.kill(); } catch { /* ignore */ } }
       proc = null;
       logger.info('ACP stopped');
     },

@@ -30,6 +30,13 @@ export interface ReactionsConfig {
   };
 }
 
+export interface SttConfig {
+  enabled: boolean;
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+}
+
 export interface Config {
   telegram: { botToken: string; allowedUsers: number[] };
   discord: {
@@ -44,6 +51,7 @@ export interface Config {
   frontend: 'telegram' | 'discord' | 'both';
   pool: PoolConfig;
   reactions: ReactionsConfig;
+  stt: SttConfig;
 }
 
 const CONFIG_DIR = path.join(os.homedir(), '.kiro-bridge');
@@ -90,6 +98,7 @@ export function loadConfig(): Config {
       frontend: 'telegram',
       pool: { maxSessions: 10, sessionTtlHours: 24 },
       reactions: DEFAULT_REACTIONS,
+      stt: { enabled: false, apiKey: '', model: 'whisper-large-v3', baseUrl: 'https://api.groq.com/openai/v1/audio/transcriptions' },
     };
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaults, null, 2), { mode: 0o600 });
@@ -100,6 +109,7 @@ export function loadConfig(): Config {
   const disc = raw.discord as Record<string, unknown> | undefined;
   const pool = raw.pool as Record<string, unknown> | undefined;
   const rxn = raw.reactions as Record<string, unknown> | undefined;
+  const stt = raw.stt as Record<string, unknown> | undefined;
 
   return {
     telegram: {
@@ -129,6 +139,12 @@ export function loadConfig(): Config {
       removeAfterReply: rxn?.removeAfterReply as boolean ?? false,
       emojis: { ...DEFAULT_REACTIONS.emojis, ...(rxn?.emojis as Record<string, string>) },
       timing: { ...DEFAULT_REACTIONS.timing, ...(rxn?.timing as Record<string, number>) },
+    },
+    stt: {
+      enabled: stt?.enabled as boolean ?? false,
+      apiKey: stt?.apiKey as string ?? '',
+      model: stt?.model as string ?? 'whisper-large-v3',
+      baseUrl: stt?.baseUrl as string ?? 'https://api.groq.com/openai/v1/audio/transcriptions',
     },
   };
 }

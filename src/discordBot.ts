@@ -1,20 +1,18 @@
 /**
  * Discord Bot — bridges Discord messages to Kiro via ACP.
- * Updated to match OpenAB v0.7.7: session pool, sender context,
- * mention resolution, image attachments, reaction state machine,
- * tail-priority truncation, GitHub URL collapsing in thread names.
+ * Updated: image resize via sharp, audio STT via Whisper, session pool,
+ * sender context, mention resolution, reaction state machine.
  */
 import {
   Client, GatewayIntentBits, Events, Message, TextChannel,
   ThreadAutoArchiveDuration, type GuildMember,
 } from 'discord.js';
-import https from 'node:https';
-import http from 'node:http';
 import { logger } from './logger.js';
 import type { SessionPool } from './sessionPool.js';
 import type { AcpEvent, ContentBlock } from './acpProtocol.js';
-import type { ReactionsConfig } from './config.js';
+import type { ReactionsConfig, SttConfig } from './config.js';
 import { createReactionController } from './reactions.js';
+import { processImage, transcribeAudio } from './media.js';
 
 export interface DiscordBotOptions {
   botToken: string;
@@ -23,6 +21,7 @@ export interface DiscordBotOptions {
   allowBotMessages: 'off' | 'mentions' | 'all';
   trustedBotIds: string[];
   reactionsConfig: ReactionsConfig;
+  sttConfig: SttConfig;
 }
 
 interface ToolEntry { id: string; title: string; state: 'running' | 'completed' | 'failed' }
@@ -30,25 +29,18 @@ interface ToolEntry { id: string; title: string; state: 'running' | 'completed' 
 function toolIcon(s: ToolEntry['state']): string {
   return s === 'running' ? '🔧' : s === 'completed' ? '✅' : '❌';
 }
-
 function sanitize(t: string): string {
   return t.replace(/\r/g, '').replace(/\n/g, ' ; ').replace(/`/g, "'");
 }
 
 function compose(tools: ToolEntry[], text: string, limit?: number): string {
   let out = '';
-  // Collapse finished tools if >3 (like OpenAB)
   const running = tools.filter(t => t.state === 'running');
   const done = tools.filter(t => t.state !== 'running');
-  if (done.length > 3) {
-    out += `✅ ${done.length} tools completed\n`;
-  } else {
-    for (const t of done) out += `${toolIcon(t.state)} \`${sanitize(t.title)}\`\n`;
-  }
+  if (done.length > 3) out += `✅ ${done.length} tools completed\n`;
+  else for (const t of done) out += `${toolIcon(t.state)} \`${sanitize(t.title)}\`\n`;
   for (const t of running) out += `🔧 \`${sanitize(t.title)}\`...\n`;
   if (tools.length) out += '\n';
-
-  // Tail-priority truncation (like OpenAB): show newest output
   let body = text.trimEnd();
   if (limit && out.length + body.length > limit) {
     const avail = limit - out.length - 4;
@@ -73,7 +65,6 @@ function splitMsg(text: string, limit = 1900): string[] {
   return chunks;
 }
 
-/** Resolve <@id> → @DisplayName (like OpenAB's discord.rs) */
 function resolveMentions(content: string, msg: Message): string {
   return content
     .replace(/<@!?(\d+)>/g, (_, id) => {
@@ -88,43 +79,29 @@ function resolveMentions(content: string, msg: Message): string {
     });
 }
 
-/** Thread name: collapse GitHub URLs, strip mentions, 40 chars (like OpenAB) */
 function shortenThreadName(prompt: string): string {
   let name = prompt
     .replace(/https?:\/\/github\.com\/([^/\s]+\/[^/\s]+)(?:\/[^\s]*)?/g, '$1')
-    .replace(/<@!?\d+>/g, '')
-    .replace(/<@&\d+>/g, '')
-    .trim();
+    .replace(/<@!?\d+>/g, '').replace(/<@&\d+>/g, '').trim();
   if (name.length > 40) name = name.substring(0, 40) + '...';
   return name || 'conversation';
 }
 
-/** Build sender context XML (like OpenAB's discord.rs) */
 function senderContext(msg: Message): string {
   const name = (msg.member as GuildMember | null)?.displayName ?? msg.author.username;
   return `<sender_context>\n  userId: ${msg.author.id}\n  displayName: ${name}\n  platform: discord\n</sender_context>\n\n`;
 }
 
-/** Download URL to Buffer */
-function downloadBuffer(url: string): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const get = url.startsWith('https') ? https.get : http.get;
-    get(url, (res) => {
-      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-      res.on('error', reject);
-    }).on('error', reject);
-  });
+/** Check if attachment is audio (voice message, ogg, mp3, etc.) */
+function isAudio(contentType?: string | null): boolean {
+  if (!contentType) return false;
+  return contentType.startsWith('audio/') || contentType === 'application/ogg';
 }
 
 export interface DiscordBotHandle { stop(): Promise<void> }
 
 export function createDiscordBot(
-  opts: DiscordBotOptions,
-  pool: SessionPool,
-  workspacePath: string,
+  opts: DiscordBotOptions, pool: SessionPool, workspacePath: string,
 ): DiscordBotHandle {
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -133,14 +110,12 @@ export function createDiscordBot(
   const allowedChannels = new Set(opts.allowedChannels);
   const allowedUsers = new Set(opts.allowedUsers);
   const trustedBots = new Set(opts.trustedBotIds);
-  // Track which threads are processing to prevent double-prompts per thread
   const processingThreads = new Set<string>();
 
   function isAllowedChannel(channelId: string, parentId?: string | null): boolean {
     if (allowedChannels.size === 0) return true;
     return allowedChannels.has(channelId) || (parentId ? allowedChannels.has(parentId) : false);
   }
-
   function isAllowedUser(userId: string): boolean {
     return allowedUsers.size === 0 || allowedUsers.has(userId);
   }
@@ -151,7 +126,6 @@ export function createDiscordBot(
     const botId = client.user?.id;
     if (!botId) return;
 
-    // Bot message handling (like OpenAB's allow_bot_messages)
     if (msg.author.bot) {
       if (opts.allowBotMessages === 'off') return;
       if (opts.allowBotMessages === 'mentions' && !msg.mentions.has(botId)) return;
@@ -168,13 +142,11 @@ export function createDiscordBot(
     const isMentioned = msg.mentions.has(botId);
     if (!inThread && !isMentioned) return;
 
-    // Resolve mentions and strip bot mention
     let prompt = isMentioned
       ? resolveMentions(msg.content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim(), msg)
       : resolveMentions(msg.content.trim(), msg);
     if (!prompt && msg.attachments.size === 0) return;
 
-    // Thread key for session pool
     const threadKey = msg.channel.isThread() ? msg.channelId : `new-${msg.id}`;
 
     if (processingThreads.has(threadKey)) {
@@ -186,7 +158,6 @@ export function createDiscordBot(
     try {
       const backend = await pool.getOrCreate(threadKey, workspacePath);
 
-      // Create thread if not already in one
       let thread = msg.channel.isThread() ? msg.channel : null;
       if (!thread) {
         thread = await (msg.channel as TextChannel).threads.create({
@@ -198,7 +169,6 @@ export function createDiscordBot(
 
       const placeholder = await thread.send('🧠 思考中...');
 
-      // Reaction controller (like OpenAB's reactions.rs)
       const rxn = createReactionController(
         opts.reactionsConfig,
         (emoji) => msg.react(emoji).then(() => {}).catch(() => {}),
@@ -206,21 +176,25 @@ export function createDiscordBot(
       );
       rxn.onQueued();
 
-      // Build content blocks (text + images)
+      // Build content blocks
       const content: ContentBlock[] = [];
-      content.push({ type: 'text', text: senderContext(msg) + prompt });
 
-      // Process image attachments (like OpenAB's media.rs)
+      // Process attachments: images → resize/compress, audio → STT
       for (const [, att] of msg.attachments) {
-        if (!att.contentType?.startsWith('image/')) continue;
-        if (att.size > 10 * 1024 * 1024) continue; // skip >10MB
-        try {
-          const buf = await downloadBuffer(att.url);
-          content.push({ type: 'image', media_type: att.contentType, data: buf.toString('base64') });
-        } catch (e) {
-          logger.warn('Failed to download image', { url: att.url, error: (e as Error).message });
+        if (att.contentType?.startsWith('image/')) {
+          const img = await processImage(att.url);
+          if (img) content.push({ type: 'image', media_type: img.mediaType, data: img.data });
+        } else if (isAudio(att.contentType)) {
+          // Transcribe audio → prepend to prompt
+          const text = await transcribeAudio(att.url, opts.sttConfig);
+          if (text) {
+            prompt = (prompt ? prompt + '\n\n' : '') + `[🎤 Voice message]: ${text}`;
+            await msg.react('🎤').catch(() => {});
+          }
         }
       }
+
+      content.unshift({ type: 'text', text: senderContext(msg) + prompt });
 
       let textBuf = '';
       const tools: ToolEntry[] = [];
@@ -229,18 +203,14 @@ export function createDiscordBot(
       let editTimer: ReturnType<typeof setTimeout> | null = null;
 
       const doEdit = async () => {
-        const d = compose(tools, textBuf, 1900);
-        await placeholder.edit(d).catch(() => {});
-        lastEdit = Date.now();
-        editQueued = false;
+        await placeholder.edit(compose(tools, textBuf, 1900)).catch(() => {});
+        lastEdit = Date.now(); editQueued = false;
       };
-
       const schedEdit = () => {
         if (editQueued) return;
         const wait = Math.max(0, 1500 - (Date.now() - lastEdit));
         editQueued = true;
-        if (wait === 0) doEdit();
-        else editTimer = setTimeout(doEdit, wait);
+        if (wait === 0) doEdit(); else editTimer = setTimeout(doEdit, wait);
       };
 
       const onEvent = (ev: AcpEvent) => {
@@ -266,9 +236,7 @@ export function createDiscordBot(
 
       const chunks = splitMsg(compose(tools, full));
       await placeholder.edit(chunks[0]).catch(() => {});
-      for (let i = 1; i < chunks.length; i++) {
-        await thread.send(chunks[i]).catch(() => {});
-      }
+      for (let i = 1; i < chunks.length; i++) await thread.send(chunks[i]).catch(() => {});
 
       rxn.onDone();
       rxn.dispose();
@@ -285,8 +253,5 @@ export function createDiscordBot(
 
   client.login(opts.botToken);
   logger.info('Discord bot starting...');
-
-  return {
-    async stop() { await client.destroy(); logger.info('Discord bot stopped'); },
-  };
+  return { async stop() { await client.destroy(); logger.info('Discord bot stopped'); } };
 }
