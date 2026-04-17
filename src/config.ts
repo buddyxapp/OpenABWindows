@@ -52,6 +52,13 @@ const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 /** Expand ${VAR} references in strings (like OpenAB's config.rs) */
 function expandEnvVars(val: unknown): unknown {
   if (typeof val === 'string') {
+    // ${file:/path/to/secret} — read from file
+    const fileMatch = val.match(/^\$\{file:(.+)\}$/);
+    if (fileMatch) {
+      try { return fs.readFileSync(fileMatch[1], 'utf-8').trim(); }
+      catch { return ''; }
+    }
+    // ${VAR} — read from env
     return val.replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? '');
   }
   if (Array.isArray(val)) return val.map(expandEnvVars);
