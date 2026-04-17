@@ -30,6 +30,17 @@ async function main() {
 
   logger.info('Starting', { frontend, command: config.acp.command, workspace: config.workspace });
 
+  // Security warnings
+  if (needDiscord && config.discord.allowedUsers.length === 0) {
+    logger.warn('⚠️  discord.allowedUsers is empty — ANYONE can use your bot! Set user IDs to restrict access.');
+  }
+  if (needDiscord && config.discord.allowedChannels.length === 0) {
+    logger.warn('⚠️  discord.allowedChannels is empty — bot responds in ALL channels.');
+  }
+  if (needTelegram && config.telegram.allowedUsers.length === 0) {
+    logger.warn('⚠️  telegram.allowedUsers is empty — ANYONE can use your bot!');
+  }
+
   const pool = createSessionPool(
     config.acp.command, config.acp.args, config.workspace, config.acp.env, config.pool,
   );
