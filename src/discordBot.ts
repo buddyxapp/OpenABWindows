@@ -93,9 +93,17 @@ function senderContext(msg: Message): string {
 }
 
 /** Check if attachment is audio (voice message, ogg, mp3, etc.) */
-function isAudio(contentType?: string | null): boolean {
+function isAudio(contentType?: string | null, flags?: number): boolean {
+  // Discord voice message flag: 1 << 13 = 8192
+  if (flags && (flags & 8192) !== 0) return true;
   if (!contentType) return false;
-  return contentType.startsWith('audio/') || contentType === 'application/ogg';
+  return contentType.startsWith('audio/') || contentType === 'application/ogg'
+    || contentType.startsWith('video/ogg');
+}
+
+/** Check if message is a voice message (has IS_VOICE_MESSAGE flag) */
+function isVoiceMessage(msg: Message): boolean {
+  return (msg.flags.bitfield & 8192) !== 0;
 }
 
 export interface DiscordBotHandle { stop(): Promise<void> }
@@ -140,12 +148,12 @@ export function createDiscordBot(
     if (!inChannel && !inThread) return;
 
     const isMentioned = msg.mentions.has(botId);
-    if (!inThread && !isMentioned) return;
+    if (!inThread && !isMentioned && !isVoiceMessage(msg)) return;
 
     let prompt = isMentioned
       ? resolveMentions(msg.content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim(), msg)
       : resolveMentions(msg.content.trim(), msg);
-    if (!prompt && msg.attachments.size === 0) return;
+    if (!prompt && msg.attachments.size === 0 && !isVoiceMessage(msg)) return;
 
     const threadKey = msg.channel.isThread() ? msg.channelId : `new-${msg.id}`;
 
@@ -184,7 +192,7 @@ export function createDiscordBot(
         if (att.contentType?.startsWith('image/')) {
           const img = await processImage(att.url);
           if (img) content.push({ type: 'image', media_type: img.mediaType, data: img.data });
-        } else if (isAudio(att.contentType)) {
+        } else if (isAudio(att.contentType, msg.flags.bitfield)) {
           // Transcribe audio → prepend to prompt
           const text = await transcribeAudio(att.url, opts.sttConfig);
           if (text) {
