@@ -11,13 +11,15 @@ import { logger } from './logger.js';
 import { createSessionPool } from './sessionPool.js';
 import { createTelegramBot } from './telegramBot.js';
 import { createDiscordBot } from './discordBot.js';
+import { createSlackBot } from './slackBot.js';
 
 async function main() {
   const config = loadConfig();
   const { frontend } = config;
 
-  const needTelegram = frontend === 'telegram' || frontend === 'both';
-  const needDiscord = frontend === 'discord' || frontend === 'both';
+  const needTelegram = frontend === 'telegram' || frontend === 'both' || frontend === 'all';
+  const needDiscord = frontend === 'discord' || frontend === 'both' || frontend === 'all';
+  const needSlack = frontend === 'slack' || frontend === 'all';
 
   if (needTelegram && !config.telegram.botToken) {
     logger.error('Telegram enabled but no botToken. Set telegram.botToken in ~/.kiro-bridge/config.json');
@@ -25,6 +27,10 @@ async function main() {
   }
   if (needDiscord && !config.discord.botToken) {
     logger.error('Discord enabled but no botToken. Set discord.botToken in ~/.kiro-bridge/config.json');
+    process.exit(1);
+  }
+  if (needSlack && (!config.slack.botToken || !config.slack.appToken)) {
+    logger.error('Slack enabled but missing tokens. Set slack.botToken and slack.appToken in ~/.kiro-bridge/config.json');
     process.exit(1);
   }
 
@@ -39,6 +45,10 @@ async function main() {
   }
   if (needTelegram && config.telegram.allowedUsers.length === 0) {
     logger.warn('⚠️  telegram.allowedUsers is empty — ANYONE can use your bot!');
+  }
+
+  if (needSlack && config.slack.allowedChannels.length === 0) {
+    logger.warn('⚠️  slack.allowedChannels is empty — bot responds in ALL channels.');
   }
 
   const pool = createSessionPool(
@@ -63,6 +73,17 @@ async function main() {
       sttConfig: config.stt,
     }, pool, config.workspace);
     stoppers.push(() => dc.stop());
+  }
+
+  if (needSlack) {
+    const sl = createSlackBot({
+      botToken: config.slack.botToken,
+      appToken: config.slack.appToken,
+      allowedChannels: config.slack.allowedChannels,
+      allowedUsers: config.slack.allowedUsers,
+      sttConfig: config.stt,
+    }, pool, config.workspace);
+    stoppers.push(() => sl.stop());
   }
 
   logger.info('Running. Ctrl+C to stop.');

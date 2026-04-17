@@ -46,9 +46,15 @@ export interface Config {
     allowBotMessages: 'off' | 'mentions' | 'all';
     trustedBotIds: string[];
   };
+  slack: {
+    botToken: string;
+    appToken: string;
+    allowedChannels: string[];
+    allowedUsers: string[];
+  };
   acp: { command: string; args: string[]; env: Record<string, string> };
   workspace: string;
-  frontend: 'telegram' | 'discord' | 'both';
+  frontend: 'telegram' | 'discord' | 'slack' | 'both' | 'all';
   pool: PoolConfig;
   reactions: ReactionsConfig;
   stt: SttConfig;
@@ -93,6 +99,7 @@ export function loadConfig(): Config {
         botToken: '', allowedChannels: [], allowedUsers: [],
         allowBotMessages: 'off', trustedBotIds: [],
       },
+      slack: { botToken: '', appToken: '', allowedChannels: [], allowedUsers: [] },
       acp: { command: 'kiro-cli', args: ['acp', '--trust-all-tools'], env: {} },
       workspace: process.cwd(),
       frontend: 'telegram',
@@ -107,6 +114,7 @@ export function loadConfig(): Config {
 
   const raw = expandEnvVars(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'))) as Record<string, unknown>;
   const disc = raw.discord as Record<string, unknown> | undefined;
+  const slk = raw.slack as Record<string, unknown> | undefined;
   const pool = raw.pool as Record<string, unknown> | undefined;
   const rxn = raw.reactions as Record<string, unknown> | undefined;
   const stt = raw.stt as Record<string, unknown> | undefined;
@@ -122,6 +130,12 @@ export function loadConfig(): Config {
       allowedUsers: disc?.allowedUsers as string[] ?? [],
       allowBotMessages: (disc?.allowBotMessages as Config['discord']['allowBotMessages']) ?? 'off',
       trustedBotIds: disc?.trustedBotIds as string[] ?? [],
+    },
+    slack: {
+      botToken: slk?.botToken as string ?? '',
+      appToken: slk?.appToken as string ?? '',
+      allowedChannels: slk?.allowedChannels as string[] ?? [],
+      allowedUsers: slk?.allowedUsers as string[] ?? [],
     },
     acp: {
       command: (raw.acp as Record<string, unknown>)?.command as string ?? 'kiro-cli',
