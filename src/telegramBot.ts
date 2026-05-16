@@ -1,6 +1,6 @@
 /**
  * Telegram Bot — bridges Telegram messages to Kiro via ACP.
- * Updated: image resize, audio STT, session pool, ContentBlock[].
+ * Synced with OpenAB v0.8.3: receiver_id, echo STT, [[reply_to]] directive.
  */
 import TelegramBot from 'node-telegram-bot-api';
 import { logger } from './logger.js';
@@ -38,6 +38,13 @@ function splitMsg(text: string, limit = 4000): string[] {
   return chunks;
 }
 
+/** Parse [[reply_to:message_id]] directives from agent output */
+function extractReplyTo(text: string): { cleanText: string; replyToId: number | null } {
+  const match = text.match(/\[\[reply_to:(\d+)\]\]/);
+  if (!match) return { cleanText: text, replyToId: null };
+  return { cleanText: text.replace(match[0], '').trim(), replyToId: parseInt(match[1]) };
+}
+
 export interface TelegramBotHandle { stop(): void }
 
 export function createTelegramBot(
@@ -51,13 +58,16 @@ export function createTelegramBot(
 
   const processingChats = new Set<number>();
   const allowed = (uid: number) => allowedUsers.length === 0 || allowedUsers.includes(uid);
+  let botUserId = '';
+
+  // Get bot info for receiver_id
+  bot.getMe().then(me => { botUserId = String(me.id); }).catch(() => {});
 
   async function editSafe(chatId: number, msgId: number, text: string) {
     try { await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown' }); }
     catch { try { await bot.editMessageText(text, { chat_id: chatId, message_id: msgId }); } catch { /* ignore */ } }
   }
 
-  /** Get Telegram file download URL */
   async function getFileUrl(fileId: string): Promise<string | null> {
     try {
       const file = await bot.getFile(fileId);
@@ -103,16 +113,15 @@ export function createTelegramBot(
     }
     processingChats.add(chatId);
     const safetyTimer = setTimeout(() => processingChats.delete(chatId), 360000);
+    const key = `tg-${chatId}`;
 
     try {
-      const key = `tg-${chatId}`;
       const backend = await pool.getOrCreate(key, workspacePath);
       const ph = await bot.sendMessage(chatId, '🧠 思考中...');
 
       let prompt = msg.text || msg.caption || '';
       const content: ContentBlock[] = [];
 
-      // Process photos — take largest
       if (hasPhoto) {
         const photo = msg.photo![msg.photo!.length - 1];
         const url = await getFileUrl(photo.file_id);
@@ -122,19 +131,22 @@ export function createTelegramBot(
         }
       }
 
-      // Process voice/audio → STT
       if (hasVoice) {
         const fileId = msg.voice?.file_id || msg.audio?.file_id;
         if (fileId) {
           const url = await getFileUrl(fileId);
           if (url) {
             const text = await transcribeAudio(url, sttConfig);
-            if (text) prompt = (prompt ? prompt + '\n\n' : '') + `[🎤 語音訊息]: ${text}`;
+            if (text) {
+              // Echo STT transcript before agent reply
+              await bot.sendMessage(chatId, `🎤 *Transcript:* ${text}`, { parse_mode: 'Markdown' }).catch(() => {});
+              prompt = (prompt ? prompt + '\n\n' : '') + `[🎤 語音訊息]: ${text}`;
+            }
           }
         }
       }
 
-      const senderCtx = `<sender_context>\n  userId: ${msg.from.id}\n  displayName: ${msg.from.first_name}\n  platform: telegram\n</sender_context>\n\n`;
+      const senderCtx = `<sender_context>\n  userId: ${msg.from.id}\n  displayName: ${msg.from.first_name}\n  platform: telegram\n  receiver_id: ${botUserId}\n  threadId: ${chatId}\n</sender_context>\n\n`;
       content.unshift({ type: 'text', text: senderCtx + prompt });
 
       let textBuf = '';
@@ -169,17 +181,40 @@ export function createTelegramBot(
         }
       };
 
+      // Abandon timeout for pending prompt cleanup
+      const abandonTimer = setTimeout(() => {
+        logger.warn('Prompt abandoned (timeout), cancelling', { key });
+        backend.cancel();
+      }, 300000);
+
       const full = await backend.sendPrompt(content, onEvent);
+      clearTimeout(abandonTimer);
       if (editTimer) clearTimeout(editTimer);
 
-      const chunks = splitMsg(compose(tools, full));
+      // Parse [[reply_to:message_id]] directive
+      const { cleanText, replyToId } = extractReplyTo(compose(tools, full));
+      const chunks = splitMsg(cleanText);
+
       for (let i = 0; i < chunks.length; i++) {
-        if (i === 0) await editSafe(chatId, ph.message_id, chunks[0]);
-        else await bot.sendMessage(chatId, chunks[i], { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(chatId, chunks[i]));
+        if (i === 0) {
+          if (replyToId) {
+            await bot.sendMessage(chatId, chunks[0], { reply_to_message_id: replyToId, parse_mode: 'Markdown' })
+              .catch(() => editSafe(chatId, ph.message_id, chunks[0]));
+          } else {
+            await editSafe(chatId, ph.message_id, chunks[0]);
+          }
+        } else {
+          await bot.sendMessage(chatId, chunks[i], { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(chatId, chunks[i]));
+        }
       }
     } catch (e) {
-      logger.error('Prompt error', { error: e instanceof Error ? e.message : String(e) });
-      await bot.sendMessage(chatId, `⚠️ ${e instanceof Error ? e.message : e}`);
+      const errMsg = e instanceof Error ? e.message : String(e);
+      logger.error('Prompt error', { error: errMsg });
+      if (errMsg.includes('Internal error') || errMsg.includes('-32603') || errMsg.includes('ACP exited') || errMsg.includes('ACP process error')) {
+        logger.info('Releasing stale session for recovery', { key });
+        pool.release(key);
+      }
+      await bot.sendMessage(chatId, `⚠️ ${errMsg}`);
     } finally {
       clearTimeout(safetyTimer);
       processingChats.delete(chatId);

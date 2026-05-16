@@ -1,6 +1,6 @@
 /**
  * ACP Protocol — JSON-RPC 2.0 types and notification classifier.
- * Updated to match OpenAB v0.7.7: image content blocks, plan events.
+ * Synced with OpenAB v0.8.1: ConfigOption, config_option_update event.
  */
 
 export interface JsonRpcMessage {
@@ -11,10 +11,74 @@ export interface JsonRpcMessage {
   params?: Record<string, unknown>;
 }
 
-/** Content blocks for prompts (text + image support like OpenAB's media.rs) */
 export type ContentBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; media_type: string; data: string };
+
+// --- ConfigOption (ACP session-level configuration) ---
+
+export interface ConfigOptionValue {
+  value: string;
+  name: string;
+  description?: string;
+}
+
+export interface ConfigOption {
+  id: string;
+  name: string;
+  description?: string;
+  category?: string;
+  type: string;
+  currentValue: string;
+  options: ConfigOptionValue[];
+}
+
+/** Extract configOptions from a JSON-RPC result. Supports standard + kiro-cli fallback. */
+export function parseConfigOptions(result: Record<string, unknown>): ConfigOption[] {
+  // Standard configOptions
+  const raw = result.configOptions as ConfigOption[] | undefined;
+  if (raw?.length) return raw;
+
+  const options: ConfigOption[] = [];
+
+  // Kiro-cli fallback: models
+  const models = result.models as Record<string, unknown> | undefined;
+  if (models) {
+    const current = (models.currentModelId as string) ?? '';
+    const available = models.availableModels as Array<Record<string, unknown>> | undefined;
+    if (available?.length) {
+      options.push({
+        id: 'model', name: 'Model', description: 'AI model selection',
+        category: 'model', type: 'enum', currentValue: current,
+        options: available.map(m => ({
+          value: (m.modelId as string) ?? (m.id as string) ?? '',
+          name: (m.name as string) ?? (m.modelId as string) ?? '',
+          description: m.description as string | undefined,
+        })).filter(v => v.value),
+      });
+    }
+  }
+
+  // Kiro-cli fallback: modes
+  const modes = result.modes as Record<string, unknown> | undefined;
+  if (modes) {
+    const current = (modes.currentModeId as string) ?? '';
+    const available = modes.availableModes as Array<Record<string, unknown>> | undefined;
+    if (available?.length) {
+      options.push({
+        id: 'agent', name: 'Agent', description: 'Agent mode selection',
+        category: 'agent', type: 'enum', currentValue: current,
+        options: available.map(m => ({
+          value: (m.id as string) ?? '',
+          name: (m.name as string) ?? (m.id as string) ?? '',
+          description: m.description as string | undefined,
+        })).filter(v => v.value),
+      });
+    }
+  }
+
+  return options;
+}
 
 export type AcpEvent =
   | { type: 'text'; content: string }
@@ -22,6 +86,7 @@ export type AcpEvent =
   | { type: 'tool_start'; id: string; title: string }
   | { type: 'tool_done'; id: string; title: string; status: 'completed' | 'failed' }
   | { type: 'status'; message: string }
+  | { type: 'config_update'; options: ConfigOption[] }
   | { type: 'turn_end' };
 
 export function classifyNotification(msg: JsonRpcMessage): AcpEvent | null {
@@ -51,6 +116,8 @@ export function classifyNotification(msg: JsonRpcMessage): AcpEvent | null {
     }
     case 'plan':
       return { type: 'status', message: 'planning' };
+    case 'config_option_update':
+      return { type: 'config_update', options: parseConfigOptions(update) };
     case 'turn_end':
       return { type: 'turn_end' };
     default:

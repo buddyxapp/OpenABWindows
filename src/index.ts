@@ -1,7 +1,7 @@
 /**
  * Kiro Bot — entry point.
  * Bridges Telegram and/or Discord to kiro-cli via ACP protocol.
- * Updated: session pool, env var expansion, reaction config.
+ * Version: 0.8.3 (synced with OpenAB v0.8.3-beta.10)
  */
 import dns from 'node:dns';
 dns.setDefaultResultOrder('ipv4first');
@@ -11,7 +11,6 @@ import { logger } from './logger.js';
 import { createSessionPool } from './sessionPool.js';
 import { createTelegramBot } from './telegramBot.js';
 import { createDiscordBot } from './discordBot.js';
-import { createSlackBot } from './slackBot.js';
 
 async function main() {
   const config = loadConfig();
@@ -34,9 +33,8 @@ async function main() {
     process.exit(1);
   }
 
-  logger.info('Starting', { frontend, command: config.acp.command, workspace: config.workspace });
+  logger.info('Starting OpenAB Windows v0.8.3', { frontend, command: config.acp.command, workspace: config.workspace });
 
-  // Security warnings
   if (needDiscord && config.discord.allowedUsers.length === 0) {
     logger.warn('⚠️  discord.allowedUsers is empty — ANYONE can use your bot! Set user IDs to restrict access.');
   }
@@ -46,7 +44,6 @@ async function main() {
   if (needTelegram && config.telegram.allowedUsers.length === 0) {
     logger.warn('⚠️  telegram.allowedUsers is empty — ANYONE can use your bot!');
   }
-
   if (needSlack && config.slack.allowedChannels.length === 0) {
     logger.warn('⚠️  slack.allowedChannels is empty — bot responds in ALL channels.');
   }
@@ -67,8 +64,10 @@ async function main() {
       botToken: config.discord.botToken,
       allowedChannels: config.discord.allowedChannels,
       allowedUsers: config.discord.allowedUsers,
+      allowedRoleIds: config.discord.allowedRoleIds,
       allowBotMessages: config.discord.allowBotMessages,
       trustedBotIds: config.discord.trustedBotIds,
+      maxBotTurns: config.discord.maxBotTurns,
       reactionsConfig: config.reactions,
       sttConfig: config.stt,
     }, pool, config.workspace);
@@ -76,6 +75,7 @@ async function main() {
   }
 
   if (needSlack) {
+    const { createSlackBot } = await import('./slackBot.js');
     const sl = createSlackBot({
       botToken: config.slack.botToken,
       appToken: config.slack.appToken,

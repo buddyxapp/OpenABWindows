@@ -1,13 +1,15 @@
 /**
  * ACP Backend — long-lived kiro-cli acp process, JSON-RPC over stdin/stdout.
- * Updated: ContentBlock[] prompts, session/load for pool resumption.
+ * Synced with OpenAB v0.8.1: ConfigOption, set_config_option, connection-close notify,
+ * session recovery, process tree kill (Windows taskkill).
  */
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { logger } from './logger.js';
 import {
-  type JsonRpcMessage, type AcpEvent, type ContentBlock,
+  type JsonRpcMessage, type AcpEvent, type ContentBlock, type ConfigOption,
   classifyNotification, buildPermissionResponse, makeRequest, makeResponse,
+  parseConfigOptions,
 } from './acpProtocol.js';
 
 export interface AcpBackend {
@@ -15,8 +17,10 @@ export interface AcpBackend {
   stop(): void;
   isAlive(): boolean;
   getSessionId(): string | null;
+  getConfigOptions(): ConfigOption[];
   sessionNew(cwd: string): Promise<string>;
   sessionLoad(sessionId: string, cwd: string): Promise<void>;
+  setConfigOption(configId: string, value: string): Promise<ConfigOption[]>;
   sendPrompt(content: ContentBlock[], onEvent: (event: AcpEvent) => void): Promise<string>;
   cancel(): void;
 }
@@ -27,6 +31,7 @@ export function createAcpBackend(
   let proc: ChildProcess | null = null;
   let nextId = 1;
   let sessionId: string | null = null;
+  let configOptions: ConfigOption[] = [];
   const pending = new Map<number, { resolve: (msg: JsonRpcMessage) => void; reject: (e: Error) => void }>();
   let promptSubscriber: ((msg: JsonRpcMessage) => void) | null = null;
   let rl: ReturnType<typeof createInterface> | null = null;
@@ -50,6 +55,16 @@ export function createAcpBackend(
       });
       writeLine(line).catch((err) => { clearTimeout(timer); pending.delete(id); reject(err); });
     });
+  }
+
+  /** Notify all waiters that the connection is dead (like OpenAB's *sub = None on EOF) */
+  function notifyConnectionClosed(reason: string): void {
+    for (const [, p] of pending) p.reject(new Error(reason));
+    pending.clear();
+    if (promptSubscriber) {
+      promptSubscriber({ id: undefined, error: { code: -1, message: reason } });
+      promptSubscriber = null;
+    }
   }
 
   function handleMessage(msg: JsonRpcMessage): void {
@@ -76,7 +91,7 @@ export function createAcpBackend(
     async start() {
       if (proc) return;
       if (rl) { rl.close(); rl = null; }
-      sessionId = null; promptSubscriber = null; pending.clear();
+      sessionId = null; promptSubscriber = null; pending.clear(); configOptions = [];
 
       const env = { ...process.env, ...extraEnv };
       logger.info('Spawning ACP process', { command, args });
@@ -91,18 +106,18 @@ export function createAcpBackend(
       proc.stderr?.on('data', (d: Buffer) => logger.debug('acp_stderr', { line: d.toString().trim() }));
       proc.on('error', (err) => {
         logger.error('ACP process error', { error: err.message });
-        for (const [, p] of pending) p.reject(err);
-        pending.clear(); proc = null;
+        notifyConnectionClosed('ACP process error: ' + err.message);
+        proc = null;
       });
       proc.on('close', (code) => {
         logger.info('ACP process exited', { code });
-        for (const [, p] of pending) p.reject(new Error(`ACP exited: ${code}`));
-        pending.clear(); proc = null; sessionId = null;
+        notifyConnectionClosed(`ACP process exited with code ${code}`);
+        proc = null; sessionId = null;
       });
 
       const resp = await sendRequest('initialize', {
         protocolVersion: 1, clientCapabilities: {},
-        clientInfo: { name: 'kiro-telegram', version: '1.1.0' },
+        clientInfo: { name: 'openab-windows', version: '1.2.0' },
       }, 120000);
       const agent = ((resp.result as Record<string, unknown>)?.agentInfo as Record<string, unknown>)?.name ?? 'unknown';
       logger.info('ACP initialized', { agent });
@@ -113,7 +128,6 @@ export function createAcpBackend(
       promptSubscriber = null; sessionId = null;
       for (const [, p] of pending) p.reject(new Error('stopped'));
       pending.clear();
-      // Process tree kill: Windows uses taskkill /T, Unix uses negative PID
       try {
         if (proc.pid) {
           const pid = proc.pid;
@@ -121,7 +135,7 @@ export function createAcpBackend(
             execSync(`taskkill /T /F /PID ${pid}`, { stdio: 'ignore' });
           } else {
             process.kill(-pid, 'SIGTERM');
-            setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ } }, 3000);
+            setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* dead */ } }, 3000);
           }
         }
       } catch { try { proc?.kill(); } catch { /* ignore */ } }
@@ -131,20 +145,49 @@ export function createAcpBackend(
 
     isAlive: () => proc != null && !proc.killed,
     getSessionId: () => sessionId,
+    getConfigOptions: () => configOptions,
 
     async sessionNew(cwd: string) {
       const resp = await sendRequest('session/new', { cwd, mcpServers: [] }, 120000);
-      const sid = (resp.result as Record<string, unknown>)?.sessionId as string;
+      const result = resp.result as Record<string, unknown>;
+      const sid = result?.sessionId as string;
       if (!sid) throw new Error('No sessionId');
       sessionId = sid;
+      configOptions = parseConfigOptions(result);
+      if (configOptions.length) logger.info('Parsed configOptions', { count: configOptions.length });
       logger.info('Session created', { sessionId: sid });
       return sid;
     },
 
     async sessionLoad(sid: string, cwd: string) {
-      await sendRequest('session/load', { sessionId: sid, cwd }, 120000);
+      const resp = await sendRequest('session/load', { sessionId: sid, cwd }, 120000);
       sessionId = sid;
+      const result = resp.result as Record<string, unknown>;
+      if (result) configOptions = parseConfigOptions(result);
       logger.info('Session loaded', { sessionId: sid });
+    },
+
+    async setConfigOption(configId: string, value: string): Promise<ConfigOption[]> {
+      if (!sessionId) throw new Error('No session');
+      try {
+        const resp = await sendRequest('session/set_config_option', {
+          sessionId, configId, value,
+        });
+        const result = resp.result as Record<string, unknown>;
+        if (result) configOptions = parseConfigOptions(result);
+        logger.info('Config option set', { configId, value });
+      } catch {
+        // Fallback: send as slash command (e.g. "/model claude-sonnet-4")
+        const cmd = `/${configId} ${value}`;
+        logger.info('set_config_option not supported, falling back to prompt', { cmd });
+        await sendRequest('session/prompt', {
+          sessionId, prompt: [{ type: 'text', text: cmd }],
+        });
+        for (const opt of configOptions) {
+          if (opt.id === configId) opt.currentValue = value;
+        }
+      }
+      return configOptions;
     },
 
     async sendPrompt(content: ContentBlock[], onEvent: (event: AcpEvent) => void): Promise<string> {
@@ -154,9 +197,15 @@ export function createAcpBackend(
       let fullText = '';
 
       return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { promptSubscriber = null; pending.delete(id); reject(new Error('Prompt timeout')); }, 300000);
+        const timer = setTimeout(() => { promptSubscriber = null; pending.delete(id); reject(new Error('Prompt timeout (5 min)')); }, 300000);
 
         promptSubscriber = (msg) => {
+          // Connection closed → reject immediately (no more waiting)
+          if (msg.error && msg.id === undefined) {
+            clearTimeout(timer); promptSubscriber = null;
+            reject(new Error(`${msg.error.message} (${msg.error.code})`));
+            return;
+          }
           if (msg.id === id) {
             clearTimeout(timer); promptSubscriber = null;
             if (msg.error) reject(new Error(`${msg.error.message} (${msg.error.code})`));
@@ -166,6 +215,7 @@ export function createAcpBackend(
           const event = classifyNotification(msg);
           if (event) {
             if (event.type === 'text') fullText += event.content;
+            if (event.type === 'config_update') configOptions = event.options;
             onEvent(event);
           }
         };

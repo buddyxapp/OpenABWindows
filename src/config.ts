@@ -1,6 +1,6 @@
 /**
  * Config loader — reads ~/.kiro-bridge/config.json
- * Now supports ${ENV_VAR} expansion (like OpenAB's config.rs)
+ * Synced with OpenAB v0.8.3: allowed_role_ids, max_bot_turns, receiver_id.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -43,8 +43,10 @@ export interface Config {
     botToken: string;
     allowedChannels: string[];
     allowedUsers: string[];
+    allowedRoleIds: string[];
     allowBotMessages: 'off' | 'mentions' | 'all';
     trustedBotIds: string[];
+    maxBotTurns: number;
   };
   slack: {
     botToken: string;
@@ -66,13 +68,11 @@ const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 /** Expand ${VAR} references in strings (like OpenAB's config.rs) */
 function expandEnvVars(val: unknown): unknown {
   if (typeof val === 'string') {
-    // ${file:/path/to/secret} — read from file
     const fileMatch = val.match(/^\$\{file:(.+)\}$/);
     if (fileMatch) {
       try { return fs.readFileSync(fileMatch[1], 'utf-8').trim(); }
       catch { return ''; }
     }
-    // ${VAR} — read from env
     return val.replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? '');
   }
   if (Array.isArray(val)) return val.map(expandEnvVars);
@@ -96,8 +96,8 @@ export function loadConfig(): Config {
     const defaults: Config = {
       telegram: { botToken: '', allowedUsers: [] },
       discord: {
-        botToken: '', allowedChannels: [], allowedUsers: [],
-        allowBotMessages: 'off', trustedBotIds: [],
+        botToken: '', allowedChannels: [], allowedUsers: [], allowedRoleIds: [],
+        allowBotMessages: 'off', trustedBotIds: [], maxBotTurns: 100,
       },
       slack: { botToken: '', appToken: '', allowedChannels: [], allowedUsers: [] },
       acp: { command: 'kiro-cli', args: ['acp', '--trust-all-tools'], env: {} },
@@ -128,8 +128,10 @@ export function loadConfig(): Config {
       botToken: disc?.botToken as string ?? '',
       allowedChannels: disc?.allowedChannels as string[] ?? [],
       allowedUsers: disc?.allowedUsers as string[] ?? [],
+      allowedRoleIds: disc?.allowedRoleIds as string[] ?? disc?.allowed_role_ids as string[] ?? [],
       allowBotMessages: (disc?.allowBotMessages as Config['discord']['allowBotMessages']) ?? 'off',
       trustedBotIds: disc?.trustedBotIds as string[] ?? [],
+      maxBotTurns: (disc?.maxBotTurns as number) ?? (disc?.max_bot_turns as number) ?? 100,
     },
     slack: {
       botToken: slk?.botToken as string ?? '',
@@ -142,7 +144,7 @@ export function loadConfig(): Config {
       args: (raw.acp as Record<string, unknown>)?.args as string[] ?? ['acp', '--trust-all-tools'],
       env: (raw.acp as Record<string, unknown>)?.env as Record<string, string> ?? {},
     },
-    workspace: (raw.workspace as string) || process.cwd(),
+    workspace: (typeof raw.workspace === 'string' ? raw.workspace : (raw.workspace as Record<string, unknown>)?.defaultPath as string) || process.cwd(),
     frontend: raw.frontend as Config['frontend'] ?? 'telegram',
     pool: {
       maxSessions: pool?.maxSessions as number ?? 10,
